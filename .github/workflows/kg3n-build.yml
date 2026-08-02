@@ -1,0 +1,19 @@
+name: kg3n-build
+# Windows-only custom RustDesk client build (KG3N fork).
+# Calls the (trimmed) flutter-build.yml, which now runs only the x64 Windows
+# Flutter path + its two helper jobs. Produces a preconfigured, silent,
+# CM-hidden rustdesk .exe/.msi and publishes them to a Release tagged kg3n-1.4.9.
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ custom-1.4.9 ]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  build:
+    uses: ./.github/workflows/flutter-build.yml
+    with:
+      upload-artifact: true
+      upload-tag: "kg3n-1.4.9"
+    secrets: inherit

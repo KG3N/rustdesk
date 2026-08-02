@@ -5848,6 +5848,14 @@ async fn start_ipc(
         #[allow(unused_mut)]
         #[allow(unused_assignments)]
         let mut args = vec!["--cm"];
+        // KG3N custom build: on Windows, run the connection manager headless
+        // (--cm-no-ui) so a controlled node NEVER shows the "someone is connecting"
+        // box, even in service mode where the GUI app isn't running to hide it.
+        // approve-mode=password auto-accepts the session, so no click is needed.
+        #[cfg(target_os = "windows")]
+        {
+            args = vec!["--cm-no-ui"];
+        }
         #[allow(unused_mut)]
         #[cfg(target_os = "linux")]
         let mut user = None;

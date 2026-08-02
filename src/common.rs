@@ -2081,6 +2081,43 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
 }
 
 pub fn load_custom_client() {
+    // KG3N custom build: bake locked settings into OVERWRITE_* (+ BUILTIN) so every
+    // process (GUI, --service, --server, --cm-no-ui) uses our server/key and the
+    // silent unattended policy regardless of which profile's config is on disk.
+    // This is called from core_main() before arg dispatch, so it applies everywhere.
+    // Inserting into all four maps (both dash/underscore variants) mirrors the
+    // fallback branch of read_custom_client_advanced_settings.
+    {
+        let baked: &[(&str, &str)] = &[
+            ("custom-rendezvous-server", "relay.kg3n.com"),
+            ("relay-server", "relay.kg3n.com"),
+            ("key", "dLROZPqAK4wVKQw9bqhsSiA+KUB7FY6zs19nAJG85SE="),
+            ("api-server", "https://relay.kg3n.com"),
+            ("approve-mode", "password"),
+            ("verification-method", "use-permanent-password"),
+            ("allow-hide-cm", "Y"),
+            ("disable-floating-window", "Y"),
+            ("hide-tray", "Y"),
+            ("allow-logon-screen-password", "Y"),
+            ("allow-remote-config-modification", "N"),
+            ("hide-server-settings", "Y"),
+            ("hide-network-settings", "Y"),
+        ];
+        let mut server_settings = config::OVERWRITE_SETTINGS.write().unwrap();
+        let mut local_settings = config::OVERWRITE_LOCAL_SETTINGS.write().unwrap();
+        let mut display_settings = config::OVERWRITE_DISPLAY_SETTINGS.write().unwrap();
+        let mut buildin_settings = config::BUILTIN_SETTINGS.write().unwrap();
+        for (k, v) in baked {
+            let k_dash = k.replace('_', "-");
+            let k_under = k_dash.replace('-', "_");
+            for kk in [k_dash.clone(), k_under.clone()] {
+                server_settings.insert(kk.clone(), v.to_string());
+                local_settings.insert(kk.clone(), v.to_string());
+                display_settings.insert(kk.clone(), v.to_string());
+                buildin_settings.insert(kk, v.to_string());
+            }
+        }
+    }
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
