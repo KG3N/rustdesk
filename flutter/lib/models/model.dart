@@ -2777,7 +2777,12 @@ class PeerInfo with ChangeNotifier {
 
   bool get isSupportMultiDisplay =>
       (isDesktop || isWebDesktop) && isSupportMultiUiSession;
-  bool get forceTextureRender => currentDisplay == kAllDisplayValue;
+  // Texture rendering has no implementation on Flutter web (Texture widget
+  // renders nothing), so the all-displays view (currentDisplay ==
+  // kAllDisplayValue) would paint a blank/gray screen. Never force texture
+  // render on web; fall back to the ImagePaint(m.image) path so video shows.
+  bool get forceTextureRender =>
+      !isWeb && currentDisplay == kAllDisplayValue;
 
   bool get cursorEmbedded => tryGetDisplay()?.cursorEmbedded ?? false;
 
