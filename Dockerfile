@@ -121,9 +121,10 @@ RUN apt-get install -y nodejs
 RUN npm install -g npm@9.8.1
 
 # Install Node.js dependencies
-RUN npm install -g yarn typescript protoc --force
-RUN npm install ts-proto vite@2.8 yarn typescript protoc --force
-RUN npm install typescript@latest
+# KG3N: pin TypeScript 4.x (project wants ^4.4.4). typescript@latest (5.x) fails
+# under Node 16's ESM loader (ERR_UNKNOWN_FILE_EXTENSION on the tsc bin).
+RUN npm install -g yarn protoc --force
+RUN npm install ts-proto vite@2.8 protoc typescript@4.9.5 --force
 
 RUN yarn build
 
