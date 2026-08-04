@@ -186,12 +186,26 @@ window.setByName = (name, value) => {
       newConn();
       startConn(value);
       break;
+    // The newer Dart web bridge (bridge.dart) drives the engine via
+    // 'session_add_sync' + 'session_start' instead of the legacy 'connect'.
+    // The stitched TS engine only knew 'connect', so the UI/deep-link path
+    // never created a Connection (curConn stayed undefined => "Connecting..."
+    // forever). Map 'session_start' onto the same connect flow; the password
+    // is delivered right after via the 'login' case (remote_page initState).
+    case 'session_add_sync':
+      break;
+    case 'session_start':
+      value = JSON.parse(value); // { id }
+      newConn();
+      startConn(value.id);
+      break;
     case 'login':
       value = JSON.parse(value);
       curConn.setRemember(value.remember == 'true');
       curConn.login(value.password);
       break;
     case 'close':
+    case 'session_close':
       close();
       break;
     case 'refresh':
