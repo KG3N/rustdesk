@@ -128,10 +128,22 @@ RUN npm install ts-proto vite@2.8 protoc typescript@4.9.5 --force
 
 RUN yarn build
 
-## ===== Web deps
+## ===== KG3N: assemble the flutter web root from web/v1
+# The real web platform folder is web/v1 (index.html references js/dist/index.js +
+# main.dart.js; plus manifest, libs). flutter build web reads web/, so lift v1's
+# contents (minus node_modules/src bloat) up into web/.
 WORKDIR $APP/flutter/web
-RUN wget https://github.com/rustdesk/doc.rustdesk.com/releases/download/console/web_deps.tar.gz
-RUN tar xzf web_deps.tar.gz
+RUN rm -rf v1/js/node_modules && \
+    cp -a v1/index.html v1/manifest.json . && \
+    (cp -a v1/libs . 2>/dev/null || true) && \
+    (cp -a v1/favicon.* . 2>/dev/null || true) && \
+    (cp -a v1/icons . 2>/dev/null || true) && \
+    mkdir -p js && cp -a v1/js/dist js/ && \
+    echo "== web/ ==" && ls -la . && echo "== web/js/dist ==" && ls -la js/dist
+
+## ===== Web deps (ogvjs + yuv-canvas -> web/, referenced by index.html)
+RUN wget https://github.com/rustdesk/doc.rustdesk.com/releases/download/console/web_deps.tar.gz && \
+    tar xzf web_deps.tar.gz && rm -f web_deps.tar.gz
 
 ## ===== Build Web app
 WORKDIR $APP/flutter
