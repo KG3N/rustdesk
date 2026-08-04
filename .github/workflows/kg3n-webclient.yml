@@ -2,6 +2,7 @@ name: kg3n-webclient
 # Builds the RustDesk web client (MonsieurBiche add-features: wss + query-param
 # auto-connect) with our relay/key baked in, extracts the static build/web files,
 # publishes them to Release 'kg3n-webclient'. Host the extracted files at rd.kg3n.com/web.
+# Rebuild trigger: session_start bridge + web texture-render fix (gray multi-display).
 on:
   workflow_dispatch: {}
   push:
