@@ -1,0 +1,43 @@
+name: kg3n-webclient
+# Builds the RustDesk web client (MonsieurBiche add-features: wss + query-param
+# auto-connect) with our relay/key baked in, extracts the static build/web files,
+# publishes them to Release 'kg3n-webclient'. Host the extracted files at rd.kg3n.com/web.
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ web-client ]
+    paths:
+      - '.github/workflows/kg3n-webclient.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Free some disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          df -h | head -3
+      - name: Build web client (Docker)
+        run: |
+          # Reuse the fork's Dockerfile build-env stage; it ends with the static
+          # site at /app/flutter/build/web (Flutter web + Rust/WASM + vcpkg codecs).
+          docker build --target build-env -t webc .
+          cid=$(docker create webc)
+          docker cp "$cid:/app/flutter/build/web" ./webbuild
+          docker rm "$cid"
+          echo "== built files =="; ls -la ./webbuild | head -40
+          # sanity: confirm our relay is baked in
+          grep -rl "relay.kg3n.com" ./webbuild >/dev/null 2>&1 && echo "BAKED: relay.kg3n.com present" || echo "WARN: relay.kg3n.com not found in build (check config)"
+          tar czf rustdesk-webclient.tar.gz -C ./webbuild .
+          sha256sum rustdesk-webclient.tar.gz
+      - name: Publish
+        uses: softprops/action-gh-release@v1
+        with:
+          prerelease: true
+          tag_name: kg3n-webclient
+          files: rustdesk-webclient.tar.gz

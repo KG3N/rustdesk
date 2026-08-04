@@ -100,8 +100,10 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
-pub const PUBLIC_RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+// KG3N: bake our relay + key so the web client defaults to our server (no config
+// entry needed on a fresh browser). ID + password arrive via the #/connect?id=&pw= URL.
+pub const RENDEZVOUS_SERVERS: &[&str] = &["relay.kg3n.com"];
+pub const PUBLIC_RS_PUB_KEY: &str = "dLROZPqAK4wVKQw9bqhsSiA+KUB7FY6zs19nAJG85SE=";
 
 pub const RS_PUB_KEY: &str = match option_env!("RS_PUB_KEY") {
     Some(key) if !key.is_empty() => key,
