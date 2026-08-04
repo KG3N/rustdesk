@@ -14,6 +14,16 @@ const HOSTS = [
 let HOST = localStorage.getItem("rendezvous-server") || HOSTS[0];
 const SCHEMA = "wss://";
 
+// KG3N: the relay runs with -k (key enforced). Punch/relay requests send
+// licence_key from localStorage "key"; a fresh browser has none, so hbbs replied
+// PunchHoleResponse.failure = LICENSE_MISMATCH and the connect hung forever at
+// "connecting". Bake the server public key so every browser presents it with no
+// config. (This is a public key; safe to ship in the client.)
+const RS_PK = "dLROZPqAK4wVKQw9bqhsSiA+KUB7FY6zs19nAJG85SE=";
+try {
+  if (!localStorage.getItem("key")) localStorage.setItem("key", RS_PK);
+} catch (e) {}
+
 type MsgboxCallback = (type: string, title: string, text: string) => void;
 type DrawCallback = (data: Uint8Array) => void;
 //const cursorCanvas = document.createElement("canvas");
@@ -89,7 +99,7 @@ export default class Connection {
     const nat_type = rendezvous.NatType.SYMMETRIC;
     const punch_hole_request = rendezvous.PunchHoleRequest.fromPartial({
       id,
-      licence_key: localStorage.getItem("key") || undefined,
+      licence_key: localStorage.getItem("key") || RS_PK,
       conn_type,
       nat_type,
       token: localStorage.getItem("access_token") || undefined,
@@ -145,7 +155,7 @@ export default class Connection {
     console.log(new Date() + ": Connected to relay server");
     this._ws = ws;
     const request_relay = rendezvous.RequestRelay.fromPartial({
-      licence_key: localStorage.getItem("key") || undefined,
+      licence_key: localStorage.getItem("key") || RS_PK,
       uuid,
     });
     ws.sendRendezvous({ request_relay });
@@ -156,7 +166,6 @@ export default class Connection {
 
   async secure(pk: Uint8Array | undefined) {
     if (pk) {
-      const RS_PK = "dLROZPqAK4wVKQw9bqhsSiA+KUB7FY6zs19nAJG85SE=";
       try {
         pk = await globals.verify(pk, localStorage.getItem("key") || RS_PK);
         if (pk) {
