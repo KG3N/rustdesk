@@ -1,0 +1,65 @@
+name: kg3n-web
+# Builds the RustDesk Flutter web client from this fork (config baked via
+# load_custom_client), publishes the static site tarball to Release 'kg3n-web'.
+# Host the extracted files at rd.kg3n.com/web.
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ custom-1.4.9 ]
+    paths:
+      - '.github/workflows/kg3n-web.yml'
+permissions:
+  contents: write
+env:
+  FLUTTER_VERSION: "3.24.5"
+  VERSION: "1.4.9"
+jobs:
+  build-web:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+      - name: Prepare env
+        run: sudo apt-get update -y && sudo apt-get install -y wget npm
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]] && git apply "${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff" || true
+      - name: Build web
+        shell: bash
+        run: |
+          pushd flutter/web/js
+          npm install yarn -g
+          npm install typescript -g
+          npm install protoc -g
+          npm install ts-proto
+          npm install vite@2.8
+          yarn install && yarn build
+          popd
+
+          pushd flutter/web
+          wget https://github.com/rustdesk/doc.rustdesk.com/releases/download/console/web_deps.tar.gz
+          tar xzf web_deps.tar.gz
+          popd
+
+          pushd flutter
+          flutter build web --release
+          cd build
+          dir_name="rustdesk-${{ env.VERSION }}-web-kg3n"
+          mv web "${dir_name}" && tar czf "${dir_name}.tar.gz" "${dir_name}"
+          sha256sum "${dir_name}.tar.gz"
+          popd
+      - name: Publish
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          prerelease: true
+          tag_name: kg3n-web
+          files: flutter/build/rustdesk-${{ env.VERSION }}-web-kg3n.tar.gz
