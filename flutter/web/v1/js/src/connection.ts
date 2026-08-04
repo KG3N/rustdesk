@@ -765,14 +765,17 @@ function getrUriFromRs(
   isRelay: Boolean = false,
   roffset: number = 0
 ): string {
-  if (uri.indexOf(":") > 0) {
-    const tmp = uri.split(":");
-    const port = parseInt(tmp[1]);
-    uri = tmp[0] + ":" + (port + (isRelay ? roffset || 3 : 2));
-  } else {
-    uri += ":" + (PORT + (isRelay ? 3 : 2));
-  }
-  return SCHEMA + uri;
+  // KG3N: the relay fronts hbbs/hbbr behind Caddy on :443 with path routing
+  //   relay.kg3n.com {
+  //     handle /ws/id*    { reverse_proxy localhost:21118 }
+  //     handle /ws/relay* { reverse_proxy localhost:21119 }
+  //   }
+  // which is the same TLS bridge the desktop client uses. The stock web-client
+  // scheme (wss://host:port+2/+3) hits the raw plain-ws ports, so the browser's
+  // wss handshake fails ("Failed to connect to rendezvous server"). Strip any
+  // port and target the bridge paths instead. roffset/PORT are now unused.
+  const host = uri.split(":")[0];
+  return SCHEMA + host + (isRelay ? "/ws/relay" : "/ws/id");
 }
 
 function hash(datas: (string | Uint8Array)[]): Uint8Array {
