@@ -111,8 +111,8 @@ RUN mkdir -p $APP
 COPY . $APP
 WORKDIR $APP
 
-## ===== Web JS
-WORKDIR $APP/flutter/web/js
+## ===== Web JS  (KG3N: the buildable web-js project is v1/js, not js)
+WORKDIR $APP/flutter/web/v1/js
 
 # Add NodeSource PPA to install a newer version of Node.js
 RUN curl -sL https://deb.nodesource.com/setup_16.x | bash -
