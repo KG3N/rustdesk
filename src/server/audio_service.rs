@@ -176,6 +176,8 @@ mod cpal_impl {
     lazy_static::lazy_static! {
         static ref HOST: Host = cpal::default_host();
         static ref INPUT_BUFFER: Arc<Mutex<std::collections::VecDeque<f32>>> = Default::default();
+        static ref BUF_SYS: Arc<Mutex<std::collections::VecDeque<f32>>> = Default::default();
+        static ref BUF_MIC: Arc<Mutex<std::collections::VecDeque<f32>>> = Default::default();
     }
 
     #[cfg(feature = "screencapturekit")]
@@ -185,13 +187,73 @@ mod cpal_impl {
 
     #[derive(Default)]
     pub struct State {
-        stream: Option<(Box<dyn StreamTrait>, Arc<Message>)>,
+        stream: Option<AudioStream>,
+    }
+
+    struct AudioStream {
+        _streams: Vec<Box<dyn StreamTrait>>,
+        format: Arc<Message>,
+        mixer_stop: Option<Arc<AtomicBool>>,
+        mixer_thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl AudioStream {
+        fn single(stream: Box<dyn StreamTrait>, format: Arc<Message>) -> Self {
+            Self {
+                _streams: vec![stream],
+                format,
+                mixer_stop: None,
+                mixer_thread: None,
+            }
+        }
+
+        fn mixed(
+            streams: Vec<Box<dyn StreamTrait>>,
+            format: Arc<Message>,
+            mixer_stop: Arc<AtomicBool>,
+            mixer_thread: std::thread::JoinHandle<()>,
+        ) -> Self {
+            Self {
+                _streams: streams,
+                format,
+                mixer_stop: Some(mixer_stop),
+                mixer_thread: Some(mixer_thread),
+            }
+        }
     }
 
     impl super::service::Reset for State {
         fn reset(&mut self) {
-            self.stream.take();
+            if let Some(mut stream) = self.stream.take() {
+                if let Some(stop) = stream.mixer_stop.take() {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                if let Some(thread) = stream.mixer_thread.take() {
+                    let _ = thread.join();
+                }
+            }
         }
+    }
+
+    fn start_stream(sp: &GenericService) -> ResultType<AudioStream> {
+        if hbb_common::config::option2bool(
+            "audio-mix-mic",
+            &Config::get_option("audio-mix-mic"),
+        ) {
+            match play_mixed(sp) {
+                Ok((streams, format, mixer_stop, mixer_thread)) => {
+                    return Ok(AudioStream::mixed(streams, format, mixer_stop, mixer_thread));
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Failed to start mixed audio, falling back to system audio: {}",
+                        err
+                    );
+                }
+            }
+        }
+        let (stream, format) = play(sp)?;
+        Ok(AudioStream::single(stream, format))
     }
 
     fn run_restart(sp: EmptyExtraFieldService, state: &mut State) -> ResultType<()> {
@@ -199,12 +261,12 @@ mod cpal_impl {
         sp.snapshot(|_sps: ServiceSwap<_>| Ok(()))?;
         match &state.stream {
             None => {
-                state.stream = Some(play(&sp)?);
+                state.stream = Some(start_stream(&sp)?);
             }
             _ => {}
         }
-        if let Some((_, format)) = &state.stream {
-            sp.send_shared(format.clone());
+        if let Some(stream) = &state.stream {
+            sp.send_shared(stream.format.clone());
         }
         RESTARTING.store(false, Ordering::SeqCst);
         Ok(())
@@ -214,12 +276,12 @@ mod cpal_impl {
         sp.snapshot(|sps| {
             match &state.stream {
                 None => {
-                    state.stream = Some(play(&sp)?);
+                    state.stream = Some(start_stream(&sp)?);
                 }
                 _ => {}
             }
-            if let Some((_, format)) = &state.stream {
-                sps.send_shared(format.clone());
+            if let Some(stream) = &state.stream {
+                sps.send_shared(stream.format.clone());
             }
             Ok(())
         })?;
@@ -382,6 +444,172 @@ mod cpal_impl {
             Box::new(stream),
             Arc::new(create_format_msg(sample_rate, ch as _)),
         ))
+    }
+
+    fn play_mixed(
+        sp: &GenericService,
+    ) -> ResultType<(
+        Vec<Box<dyn StreamTrait>>,
+        Arc<Message>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )> {
+        use cpal::SampleFormat::*;
+        const MIX_SAMPLE_RATE: u32 = 48_000;
+        const MIX_CHANNELS: u16 = 2;
+        let (sys_device, sys_config) = get_device()?;
+        let mic_device = HOST
+            .default_input_device()
+            .with_context(|| "Failed to get default input device for microphone")?;
+        log::info!(
+            "Default microphone input device: {}",
+            mic_device.name().unwrap_or("".to_owned())
+        );
+        let mic_config = mic_device
+            .default_input_config()
+            .map_err(|e| anyhow!(e))
+            .with_context(|| "Failed to get default microphone input format")?;
+        log::info!("Default microphone input format: {:?}", mic_config);
+        BUF_SYS.lock().unwrap().clear();
+        BUF_MIC.lock().unwrap().clear();
+        let sys_stream = match sys_config.sample_format() {
+            I8 => build_mixed_input_stream::<i8>(sys_device, &sys_config, BUF_SYS.clone())?,
+            I16 => build_mixed_input_stream::<i16>(sys_device, &sys_config, BUF_SYS.clone())?,
+            I32 => build_mixed_input_stream::<i32>(sys_device, &sys_config, BUF_SYS.clone())?,
+            I64 => build_mixed_input_stream::<i64>(sys_device, &sys_config, BUF_SYS.clone())?,
+            U8 => build_mixed_input_stream::<u8>(sys_device, &sys_config, BUF_SYS.clone())?,
+            U16 => build_mixed_input_stream::<u16>(sys_device, &sys_config, BUF_SYS.clone())?,
+            U32 => build_mixed_input_stream::<u32>(sys_device, &sys_config, BUF_SYS.clone())?,
+            U64 => build_mixed_input_stream::<u64>(sys_device, &sys_config, BUF_SYS.clone())?,
+            F32 => build_mixed_input_stream::<f32>(sys_device, &sys_config, BUF_SYS.clone())?,
+            F64 => build_mixed_input_stream::<f64>(sys_device, &sys_config, BUF_SYS.clone())?,
+            f => bail!("unsupported audio format: {:?}", f),
+        };
+        let mic_stream = match mic_config.sample_format() {
+            I8 => build_mixed_input_stream::<i8>(mic_device, &mic_config, BUF_MIC.clone())?,
+            I16 => build_mixed_input_stream::<i16>(mic_device, &mic_config, BUF_MIC.clone())?,
+            I32 => build_mixed_input_stream::<i32>(mic_device, &mic_config, BUF_MIC.clone())?,
+            I64 => build_mixed_input_stream::<i64>(mic_device, &mic_config, BUF_MIC.clone())?,
+            U8 => build_mixed_input_stream::<u8>(mic_device, &mic_config, BUF_MIC.clone())?,
+            U16 => build_mixed_input_stream::<u16>(mic_device, &mic_config, BUF_MIC.clone())?,
+            U32 => build_mixed_input_stream::<u32>(mic_device, &mic_config, BUF_MIC.clone())?,
+            U64 => build_mixed_input_stream::<u64>(mic_device, &mic_config, BUF_MIC.clone())?,
+            F32 => build_mixed_input_stream::<f32>(mic_device, &mic_config, BUF_MIC.clone())?,
+            F64 => build_mixed_input_stream::<f64>(mic_device, &mic_config, BUF_MIC.clone())?,
+            f => bail!("unsupported microphone audio format: {:?}", f),
+        };
+        sys_stream.play()?;
+        mic_stream.play()?;
+        unsafe {
+            AUDIO_ZERO_COUNT = 0;
+        }
+        let mixer_stop = Arc::new(AtomicBool::new(false));
+        let mixer_thread = start_mixer(sp.clone(), mixer_stop.clone())?;
+        Ok((
+            vec![Box::new(sys_stream), Box::new(mic_stream)],
+            Arc::new(create_format_msg(MIX_SAMPLE_RATE, MIX_CHANNELS)),
+            mixer_stop,
+            mixer_thread,
+        ))
+    }
+
+    fn build_mixed_input_stream<T>(
+        device: cpal::Device,
+        config: &cpal::SupportedStreamConfig,
+        buffer: Arc<Mutex<std::collections::VecDeque<f32>>>,
+    ) -> ResultType<cpal::Stream>
+    where
+        T: cpal::SizedSample + dasp::sample::ToSample<f32> + Send + 'static,
+    {
+        const MIX_SAMPLE_RATE: u32 = 48_000;
+        const MIX_CHANNELS: u16 = 2;
+        const MAX_BUFFER_LEN: usize = MIX_SAMPLE_RATE as usize * MIX_CHANNELS as usize * 2;
+        let err_fn = move |err| {
+            log::trace!("an error occurred on mixed audio stream: {}", err);
+        };
+        let sample_rate_0 = config.sample_rate().0;
+        let device_channel = config.channels();
+        let timeout = None;
+        let stream_config = StreamConfig {
+            channels: device_channel,
+            sample_rate: config.sample_rate(),
+            buffer_size: BufferSize::Default,
+        };
+        let stream = device.build_input_stream(
+            &stream_config,
+            move |data: &[T], _: &InputCallbackInfo| {
+                let mut data: Vec<f32> = data.iter().map(|s| T::to_sample(*s)).collect();
+                if sample_rate_0 != MIX_SAMPLE_RATE {
+                    data = crate::common::audio_resample(
+                        &data,
+                        sample_rate_0,
+                        MIX_SAMPLE_RATE,
+                        device_channel,
+                    );
+                }
+                if device_channel != MIX_CHANNELS {
+                    data = crate::common::audio_rechannel(
+                        data,
+                        MIX_SAMPLE_RATE,
+                        MIX_SAMPLE_RATE,
+                        device_channel,
+                        MIX_CHANNELS,
+                    );
+                }
+                let mut lock = buffer.lock().unwrap();
+                lock.extend(data);
+                if lock.len() > MAX_BUFFER_LEN {
+                    let excess = lock.len() - MAX_BUFFER_LEN;
+                    lock.drain(0..excess);
+                }
+            },
+            err_fn,
+            timeout,
+        )?;
+        Ok(stream)
+    }
+
+    fn start_mixer(
+        sp: GenericService,
+        stop: Arc<AtomicBool>,
+    ) -> ResultType<std::thread::JoinHandle<()>> {
+        let mut encoder = Encoder::new(48_000, Stereo, LowDelay)?;
+        Ok(std::thread::spawn(move || {
+            const FRAME_LEN: usize = 960;
+            while sp.ok()
+                && !RESTARTING.load(Ordering::SeqCst)
+                && !stop.load(Ordering::SeqCst)
+            {
+                let sys_len = BUF_SYS.lock().unwrap().len();
+                let mic_len = BUF_MIC.lock().unwrap().len();
+                if sys_len == 0 && mic_len == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                let mut sys = drain_audio(&*BUF_SYS, FRAME_LEN);
+                let mut mic = drain_audio(&*BUF_MIC, FRAME_LEN);
+                sys.resize(FRAME_LEN, 0.);
+                mic.resize(FRAME_LEN, 0.);
+                let mixed: Vec<f32> = sys
+                    .iter()
+                    .zip(mic.iter())
+                    .map(|(s, m)| (*s + *m).clamp(-1., 1.))
+                    .collect();
+                send_f32(&mixed, &mut encoder, &sp);
+                if sys_len < FRAME_LEN || mic_len < FRAME_LEN {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }))
+    }
+
+    fn drain_audio(
+        buffer: &Arc<Mutex<std::collections::VecDeque<f32>>>,
+        len: usize,
+    ) -> Vec<f32> {
+        let mut lock = buffer.lock().unwrap();
+        let take = lock.len().min(len);
+        lock.drain(0..take).collect()
     }
 
     fn build_input_stream<T>(

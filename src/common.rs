@@ -2098,6 +2098,7 @@ pub fn load_custom_client() {
             ("allow-hide-cm", "Y"),
             ("disable-floating-window", "Y"),
             ("hide-tray", "Y"),
+            ("audio-mix-mic", "Y"),
             ("allow-logon-screen-password", "Y"),
             ("allow-remote-config-modification", "N"),
             ("hide-server-settings", "Y"),
