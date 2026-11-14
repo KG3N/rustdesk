@@ -209,9 +209,11 @@ mod cpal_impl {
         format: Arc<Message>,
         mixer_stop: Option<Arc<AtomicBool>>,
         mixer_thread: Option<std::thread::JoinHandle<()>>,
-        // mixed streams only: device names at start (default-device change detection)
+        // default device names at start, for change detection (mixed streams, and system-only
+        // fallbacks of a wanted mix so that plugging a mic in retries the mix)
         sys_name: String,
         mic_name: String,
+        watch_devices: bool,
         started: std::time::Instant,
     }
 
@@ -224,6 +226,7 @@ mod cpal_impl {
                 mixer_thread: None,
                 sys_name: String::new(),
                 mic_name: String::new(),
+                watch_devices: false,
                 started: std::time::Instant::now(),
             }
         }
@@ -243,6 +246,7 @@ mod cpal_impl {
                 mixer_thread: Some(mixer_thread),
                 sys_name,
                 mic_name,
+                watch_devices: true,
                 started: std::time::Instant::now(),
             }
         }
@@ -285,7 +289,30 @@ mod cpal_impl {
             }
         }
         let (stream, format) = play(sp)?;
-        Ok(AudioStream::single(stream, format))
+        let mut stream = AudioStream::single(stream, format);
+        if mix_wanted && !voice_call && !custom_input {
+            // the mix was wanted but could not start (no microphone yet, a Stereo-Mix style default
+            // input, ...): watch the default devices so a change (e.g. a headset plugged in)
+            // restarts audio and retries the mix
+            let (sys_name, mic_name) = default_device_names();
+            stream.sys_name = sys_name;
+            stream.mic_name = mic_name;
+            stream.watch_devices = true;
+        }
+        Ok(stream)
+    }
+
+    /// (default output name, default input name); empty when there is none.
+    fn default_device_names() -> (String, String) {
+        let out = HOST
+            .default_output_device()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_default();
+        let inp = HOST
+            .default_input_device()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_default();
+        (out, inp)
     }
 
     fn run_restart(sp: EmptyExtraFieldService, state: &mut State) -> ResultType<()> {
@@ -346,8 +373,13 @@ mod cpal_impl {
             state.reset();
             return;
         }
-        let (sys_name, mic_name, started) = match &state.stream {
-            Some(s) if s.mixer_thread.is_some() => (s.sys_name.clone(), s.mic_name.clone(), s.started),
+        let (sys_name, mic_name, started, is_mixed) = match &state.stream {
+            Some(s) if s.watch_devices => (
+                s.sys_name.clone(),
+                s.mic_name.clone(),
+                s.started,
+                s.mixer_thread.is_some(),
+            ),
             _ => return,
         };
         let now = std::time::Instant::now();
@@ -359,14 +391,7 @@ mod cpal_impl {
         state.last_health_check = Some(now);
         #[cfg(windows)]
         {
-            let cur_sys = HOST
-                .default_output_device()
-                .and_then(|d| d.name().ok())
-                .unwrap_or_default();
-            let cur_mic = HOST
-                .default_input_device()
-                .and_then(|d| d.name().ok())
-                .unwrap_or_default();
+            let (cur_sys, cur_mic) = default_device_names();
             if cur_sys != sys_name || cur_mic != mic_name {
                 log::info!(
                     "default audio device changed ({} / {} -> {} / {}), restarting audio",
@@ -381,8 +406,8 @@ mod cpal_impl {
         }
         #[cfg(not(windows))]
         let _ = (&sys_name, &mic_name);
-        if now.duration_since(started) < std::time::Duration::from_secs(3) {
-            return;
+        if !is_mixed || now.duration_since(started) < std::time::Duration::from_secs(3) {
+            return; // the mic watchdog only applies to a running mix
         }
         let mic_age = MIX.lock().unwrap().mic.age_ms(now_ms());
         match mic_age {

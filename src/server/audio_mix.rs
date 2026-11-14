@@ -33,9 +33,46 @@ pub const KEEP_AFTER_TRIM: usize = FRAME * 4;
 /// Absolute buffer cap (2 s), in case the mixer thread is not draining at all.
 pub const MAX_BUF: usize = RATE as usize * CHANNELS * 2;
 
+/// Per-input-channel (left, right) weights for a stereo downmix, using the standard Windows
+/// (WAVEFORMATEXTENSIBLE) channel orders: 3 = FL FR FC, 4 = FL FR BL BR, 5 = FL FR FC BL BR,
+/// 6 = 5.1 FL FR FC LFE BL BR, 8 = 7.1 FL FR FC LFE BL BR SL SR. Centre goes to both sides,
+/// surrounds fold into their side at -3 dB, LFE is dropped. Other counts (e.g. mic arrays with an
+/// unknown layout) fall back to averaging even channels into L and odd ones into R.
+fn downmix_weights(n: usize) -> Vec<(f32, f32)> {
+    const C: f32 = std::f32::consts::FRAC_1_SQRT_2; // -3 dB
+    match n {
+        3 => vec![(1.0, 0.0), (0.0, 1.0), (C, C)],
+        4 => vec![(1.0, 0.0), (0.0, 1.0), (C, 0.0), (0.0, C)],
+        5 => vec![(1.0, 0.0), (0.0, 1.0), (C, C), (C, 0.0), (0.0, C)],
+        6 => vec![(1.0, 0.0), (0.0, 1.0), (C, C), (0.0, 0.0), (C, 0.0), (0.0, C)],
+        8 => vec![
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (C, C),
+            (0.0, 0.0),
+            (C, 0.0),
+            (0.0, C),
+            (C, 0.0),
+            (0.0, C),
+        ],
+        _ => {
+            let (n_l, n_r) = ((n + 1) / 2, n / 2);
+            (0..n)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        (1.0 / n_l as f32, 0.0)
+                    } else {
+                        (0.0, 1.0 / n_r as f32)
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
 /// Interleaved `channels`-channel samples -> interleaved stereo. Mono is copied to both sides;
-/// more than two channels (mic arrays, 5.1/7.1 loopback) average even-indexed channels into L
-/// and odd-indexed ones into R. A trailing partial frame is ignored.
+/// more channels use `downmix_weights` (layout-aware for 3/4/5/6/8). A trailing partial frame is
+/// ignored. Downmixed peaks above full scale are handled by the soft limiter later.
 pub fn to_stereo(data: &[f32], channels: usize) -> Vec<f32> {
     match channels {
         0 => Vec::new(),
@@ -49,22 +86,18 @@ pub fn to_stereo(data: &[f32], channels: usize) -> Vec<f32> {
         }
         2 => data[..data.len() - data.len() % 2].to_vec(),
         n => {
+            let w = downmix_weights(n);
             let frames = data.len() / n;
-            let n_l = (n + 1) / 2; // even indices 0,2,4..
-            let n_r = n / 2; // odd indices 1,3,5..
             let mut out = Vec::with_capacity(frames * 2);
             for f in 0..frames {
                 let fr = &data[f * n..(f + 1) * n];
                 let (mut l, mut r) = (0f32, 0f32);
-                for (i, s) in fr.iter().enumerate() {
-                    if i % 2 == 0 {
-                        l += *s;
-                    } else {
-                        r += *s;
-                    }
+                for (s, (wl, wr)) in fr.iter().zip(w.iter()) {
+                    l += s * wl;
+                    r += s * wr;
                 }
-                out.push(l / n_l as f32);
-                out.push(r / n_r as f32);
+                out.push(l);
+                out.push(r);
             }
             out
         }
@@ -139,7 +172,13 @@ impl StreamResampler {
 pub struct SourceBuf {
     buf: VecDeque<f32>,
     last_push_ms: Option<u64>,
+    /// largest packet this device has delivered (samples); scales liveness + latency limits so a
+    /// device with big callbacks (e.g. 100 ms) is neither trimmed nor treated as idle between them
+    max_chunk: usize,
 }
+
+/// interleaved 48 kHz stereo samples per millisecond
+const SAMPLES_PER_MS: usize = RATE as usize / 1000 * CHANNELS;
 
 impl SourceBuf {
     pub fn push(&mut self, samples: &[f32], now_ms: u64) {
@@ -149,14 +188,26 @@ impl SourceBuf {
             let excess = (self.buf.len() - MAX_BUF + 1) & !1;
             self.buf.drain(0..excess.min(self.buf.len()));
         }
+        self.max_chunk = self.max_chunk.max(even);
         self.last_push_ms = Some(now_ms);
     }
     pub fn len(&self) -> usize {
         self.buf.len()
     }
+    /// "Still delivering" window: LIVE_MS, or two packets' worth for devices with large packets.
+    fn live_window_ms(&self) -> u64 {
+        LIVE_MS.max((self.max_chunk / SAMPLES_PER_MS) as u64 * 2 + 10)
+    }
+    /// Latency cap before trimming: MAX_LAG, or room for two packets plus a frame.
+    fn lag_cap(&self) -> usize {
+        MAX_LAG.max(self.max_chunk * 2 + FRAME)
+    }
+    fn keep_after_trim(&self) -> usize {
+        KEEP_AFTER_TRIM.max(self.max_chunk + FRAME)
+    }
     pub fn is_live(&self, now_ms: u64) -> bool {
         self.last_push_ms
-            .map(|t| now_ms.saturating_sub(t) <= LIVE_MS)
+            .map(|t| now_ms.saturating_sub(t) <= self.live_window_ms())
             .unwrap_or(false)
     }
     /// Milliseconds since this source last delivered, or None if it never did.
@@ -180,6 +231,7 @@ impl SourceBuf {
     pub fn clear(&mut self) {
         self.buf.clear();
         self.last_push_ms = None;
+        self.max_chunk = 0;
     }
 }
 
@@ -210,11 +262,13 @@ impl Mixer {
     }
 
     pub fn next_frame(&mut self, now_ms: u64) -> Option<MixFrame> {
-        // latency cap / drift correction: a source that ran ahead is trimmed back
+        // latency cap / drift correction: a source that ran ahead is trimmed back (limits scale
+        // with the device's packet size, so a normal large packet is never mistaken for drift)
         for b in [&mut self.sys, &mut self.mic] {
-            if b.len() > MAX_LAG {
+            if b.len() > b.lag_cap() {
                 let before = b.len();
-                b.trim_to(KEEP_AFTER_TRIM);
+                let keep = b.keep_after_trim();
+                b.trim_to(keep);
                 self.trimmed += (before - b.len()) as u64;
             }
         }
@@ -392,12 +446,37 @@ mod tests {
     fn stereo_conversion() {
         assert_eq!(to_stereo(&[0.1, 0.2], 1), vec![0.1, 0.1, 0.2, 0.2]);
         assert_eq!(to_stereo(&[0.1, 0.2, 0.3, 0.4, 0.9], 2), vec![0.1, 0.2, 0.3, 0.4]);
-        // 4 channels: L = mean(ch0, ch2), R = mean(ch1, ch3)
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        // 4 channels (quad FL FR BL BR): backs fold into their side at -3 dB
         let v = to_stereo(&[0.2, 0.4, 0.6, 0.8], 4);
-        assert!((v[0] - 0.4).abs() < 1e-6 && (v[1] - 0.6).abs() < 1e-6);
-        // 6 channels (5.1) gives one stereo frame per input frame
+        assert!((v[0] - (0.2 + c * 0.6)).abs() < 1e-6 && (v[1] - (0.4 + c * 0.8)).abs() < 1e-6);
+        // 5.1 FL FR FC LFE BL BR: centre (dialogue) on BOTH sides, LFE dropped
+        let v = to_stereo(&[0.0, 0.0, 0.5, 0.9, 0.0, 0.0], 6);
+        assert!((v[0] - c * 0.5).abs() < 1e-6 && (v[1] - c * 0.5).abs() < 1e-6, "{:?}", v);
         assert_eq!(to_stereo(&vec![0.5; 6 * 10], 6).len(), 20);
+        // 7.1: side channels fold into their side
+        let v = to_stereo(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.4, 0.0], 8);
+        assert!((v[0] - c * 0.4).abs() < 1e-6 && v[1].abs() < 1e-6);
+        // unknown layout (e.g. 7 channels): averaging fallback stays in range
+        let v = to_stereo(&[1.0; 7], 7);
+        assert!((v[0] - 1.0).abs() < 1e-6 && (v[1] - 1.0).abs() < 1e-6);
         assert!(to_stereo(&[0.5; 3], 0).is_empty());
+    }
+
+    #[test]
+    fn mixer_large_capture_packets_are_not_trimmed_or_treated_idle() {
+        // devices delivering 100 ms per callback (4800 stereo frames): no audio may be trimmed,
+        // the rate stays 100 frames/s, and neither source is padded while both deliver
+        let (frames, bad, _, trimmed) =
+            simulate(10, Some((100_000, 0, 4800)), Some((100_000, 50_000, 4800)));
+        assert_eq!(trimmed, 0, "large packets trimmed as if they were drift");
+        assert!((frames as i64 - 1000).abs() <= 10, "frames {}", frames);
+        assert!(bad <= 1, "padded {}", bad);
+        // mixed sizes: 100 ms system packets + 10 ms mic packets
+        let (frames, bad, _, trimmed) =
+            simulate(10, Some((100_000, 0, 4800)), Some((10_000, 3_000, 480)));
+        assert_eq!(trimmed, 0);
+        assert!((frames as i64 - 1000).abs() <= 10 && bad <= 1, "frames {} bad {}", frames, bad);
     }
 
     #[test]
