@@ -198,13 +198,6 @@ impl SourceBuf {
     fn live_window_ms(&self) -> u64 {
         LIVE_MS.max((self.max_chunk / SAMPLES_PER_MS) as u64 * 2 + 10)
     }
-    /// Latency cap before trimming: MAX_LAG, or room for two packets plus a frame.
-    fn lag_cap(&self) -> usize {
-        MAX_LAG.max(self.max_chunk * 2 + FRAME)
-    }
-    fn keep_after_trim(&self) -> usize {
-        KEEP_AFTER_TRIM.max(self.max_chunk + FRAME)
-    }
     pub fn is_live(&self, now_ms: u64) -> bool {
         self.last_push_ms
             .map(|t| now_ms.saturating_sub(t) <= self.live_window_ms())
@@ -262,12 +255,16 @@ impl Mixer {
     }
 
     pub fn next_frame(&mut self, now_ms: u64) -> Option<MixFrame> {
-        // latency cap / drift correction: a source that ran ahead is trimmed back (limits scale
-        // with the device's packet size, so a normal large packet is never mistaken for drift)
+        // Latency cap / drift correction: a source that ran ahead is trimmed back. Either buffer may
+        // legitimately hold up to one packet of the OTHER source while waiting for it, so the
+        // limits scale with the largest packet of either device (a normal large packet is never
+        // mistaken for drift); with ordinary 10 ms devices they are MAX_LAG / KEEP_AFTER_TRIM.
+        let chunk = self.sys.max_chunk.max(self.mic.max_chunk);
+        let cap = MAX_LAG.max(chunk * 2 + FRAME);
+        let keep = KEEP_AFTER_TRIM.max(chunk + FRAME);
         for b in [&mut self.sys, &mut self.mic] {
-            if b.len() > b.lag_cap() {
+            if b.len() > cap {
                 let before = b.len();
-                let keep = b.keep_after_trim();
                 b.trim_to(keep);
                 self.trimmed += (before - b.len()) as u64;
             }
