@@ -117,7 +117,17 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
     }
 }
 
+/// KG3N custom client: self-update is disabled entirely, including a manual "check for update"
+/// from the GUI. The update path downloads the OFFICIAL RustDesk installer (this build keeps the app
+/// name "RustDesk", so is_custom_client() is false), which would replace the custom client and drop
+/// the node off the fleet relay. Updates are delivered by the fleet agent's Upgrade (KG3N releases).
+const KG3N_SELF_UPDATE_DISABLED: bool = true;
+
 fn check_update(manually: bool) -> ResultType<()> {
+    if KG3N_SELF_UPDATE_DISABLED {
+        log::info!("self-update disabled in the KG3N custom client (manual: {})", manually);
+        return Ok(());
+    }
     #[cfg(target_os = "windows")]
     let update_msi = crate::platform::is_msi_installed()? && !crate::is_custom_client();
     if !(manually || config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE)) {

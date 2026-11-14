@@ -2098,6 +2098,11 @@ pub fn load_custom_client() {
             ("allow-hide-cm", "Y"),
             ("disable-floating-window", "Y"),
             ("hide-tray", "Y"),
+            // never self-update from rustdesk.com: the official installer would replace this custom
+            // build (baked relay/key/silent policy). Updates come only via the fleet Upgrade.
+            ("allow-auto-update", "N"),
+            // no "new version available" check against api.rustdesk.com / nudge toward stock RustDesk
+            ("enable-check-update", "N"),
             ("allow-logon-screen-password", "Y"),
             ("allow-remote-config-modification", "N"),
             ("hide-server-settings", "Y"),
