@@ -471,12 +471,12 @@ mod tests {
             simulate(10, Some((100_000, 0, 4800)), Some((100_000, 50_000, 4800)));
         assert_eq!(trimmed, 0, "large packets trimmed as if they were drift");
         assert!((frames as i64 - 1000).abs() <= 10, "frames {}", frames);
-        assert!(bad <= 1, "padded {}", bad);
+        assert_eq!(bad, 0, "padded a delivering source");
         // mixed sizes: 100 ms system packets + 10 ms mic packets
         let (frames, bad, _, trimmed) =
             simulate(10, Some((100_000, 0, 4800)), Some((10_000, 3_000, 480)));
         assert_eq!(trimmed, 0);
-        assert!((frames as i64 - 1000).abs() <= 10 && bad <= 1, "frames {} bad {}", frames, bad);
+        assert!((frames as i64 - 1000).abs() <= 10 && bad == 0, "frames {} bad {}", frames, bad);
     }
 
     #[test]
@@ -536,6 +536,9 @@ mod tests {
         let (mut next_s, mut next_m) = (sys.map(|s| s.1), mic.map(|s| s.1));
         let mut next_poll = 0u64;
         let (mut frames, mut bad, mut maxlen) = (0u64, 0u64, 0usize);
+        // a source only counts once it has started delivering: padding a device that has not
+        // produced its first packet yet (stream start) is correct, padding a delivering one is not
+        let (mut s_started, mut m_started) = (false, false);
         let mut t = 0u64;
         while t < end_us {
             let mut nt = next_poll;
@@ -547,18 +550,18 @@ mod tests {
                 let (p, _, c) = sys.unwrap();
                 m.sys.push(&vec![0.1; c * 2], now_ms);
                 next_s = Some(t + p);
+                s_started = true;
             }
             if Some(t) == next_m {
                 let (p, _, c) = mic.unwrap();
                 m.mic.push(&vec![0.2; c * 2], now_ms);
                 next_m = Some(t + p);
+                m_started = true;
             }
             if t == next_poll {
                 while let Some(f) = m.next_frame(now_ms) {
                     frames += 1;
-                    let s_live_and_padded = f.sys_padded && sys.is_some();
-                    let m_live_and_padded = f.mic_padded && mic.is_some();
-                    if s_live_and_padded || m_live_and_padded {
+                    if (f.sys_padded && s_started) || (f.mic_padded && m_started) {
                         bad += 1;
                     }
                 }
@@ -577,12 +580,12 @@ mod tests {
         let (frames, bad, maxlen, _) =
             simulate(10, Some((10_000, 0, 480)), Some((10_000, 5_000, 480)));
         assert!((frames as i64 - 1000).abs() <= 2, "frames {}", frames);
-        assert!(bad <= 1, "padded frames while both live: {}", bad);
+        assert_eq!(bad, 0, "padded a delivering source");
         assert!(maxlen <= MAX_LAG, "maxlen {}", maxlen);
         // odd 3 ms packets on one side
         let (frames, bad, _, _) = simulate(10, Some((3_000, 0, 144)), Some((10_000, 1_000, 480)));
         assert!((frames as i64 - 1000).abs() <= 2, "frames {}", frames);
-        assert!(bad <= 1, "padded: {}", bad);
+        assert_eq!(bad, 0, "padded a delivering source");
     }
 
     #[test]
@@ -604,13 +607,13 @@ mod tests {
         assert!(maxlen <= MAX_LAG + 960, "maxlen {}", maxlen);
         assert!(trimmed > 0, "expected drift trimming");
         assert!((frames as i64 - 6000).abs() <= 10, "frames {}", frames);
-        assert!(bad <= 1, "padded: {}", bad);
+        assert_eq!(bad, 0, "padded a delivering source");
         // realistic 0.01% drift for 60 s: well under the cap, nothing trimmed, nothing padded
         let (frames, bad, maxlen, trimmed) =
             simulate(60, Some((9_999, 0, 480)), Some((10_000, 4_000, 480)));
         assert_eq!(trimmed, 0);
         assert!(maxlen <= MAX_LAG, "maxlen {}", maxlen);
-        assert!((frames as i64 - 6000).abs() <= 10 && bad <= 1, "frames {} bad {}", frames, bad);
+        assert!((frames as i64 - 6000).abs() <= 10 && bad == 0, "frames {} bad {}", frames, bad);
     }
 
     #[test]
