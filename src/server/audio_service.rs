@@ -176,9 +176,22 @@ mod cpal_impl {
     lazy_static::lazy_static! {
         static ref HOST: Host = cpal::default_host();
         static ref INPUT_BUFFER: Arc<Mutex<std::collections::VecDeque<f32>>> = Default::default();
-        static ref BUF_SYS: Arc<Mutex<std::collections::VecDeque<f32>>> = Default::default();
-        static ref BUF_MIC: Arc<Mutex<std::collections::VecDeque<f32>>> = Default::default();
+        // KG3N mixed (system + mic) audio: per-source FIFOs + the source-clocked mixer
+        // (crate::server::audio_mix). Callbacks push, the mixer thread pulls 10 ms frames.
+        static ref MIX: Arc<Mutex<crate::server::audio_mix::Mixer>> = Default::default();
+        static ref MIX_EPOCH: std::time::Instant = std::time::Instant::now();
     }
+
+    /// Monotonic milliseconds for the mixer's "is this source still delivering" bookkeeping.
+    fn now_ms() -> u64 {
+        MIX_EPOCH.elapsed().as_millis() as u64
+    }
+
+    // mic watchdog restarts in a row (reset once the mic delivers again); capped at 3 so a mic that
+    // is truly dead degrades to system-audio-only instead of restarting forever
+    static MIC_WATCHDOG_RESTARTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // last device-error-triggered restart (throttle: at most one per 3 s)
+    static LAST_ERR_RESTART_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     #[cfg(feature = "screencapturekit")]
     lazy_static::lazy_static! {
@@ -188,6 +201,7 @@ mod cpal_impl {
     #[derive(Default)]
     pub struct State {
         stream: Option<AudioStream>,
+        last_health_check: Option<std::time::Instant>,
     }
 
     struct AudioStream {
@@ -195,6 +209,10 @@ mod cpal_impl {
         format: Arc<Message>,
         mixer_stop: Option<Arc<AtomicBool>>,
         mixer_thread: Option<std::thread::JoinHandle<()>>,
+        // mixed streams only: device names at start (default-device change detection)
+        sys_name: String,
+        mic_name: String,
+        started: std::time::Instant,
     }
 
     impl AudioStream {
@@ -204,6 +222,9 @@ mod cpal_impl {
                 format,
                 mixer_stop: None,
                 mixer_thread: None,
+                sys_name: String::new(),
+                mic_name: String::new(),
+                started: std::time::Instant::now(),
             }
         }
 
@@ -212,12 +233,17 @@ mod cpal_impl {
             format: Arc<Message>,
             mixer_stop: Arc<AtomicBool>,
             mixer_thread: std::thread::JoinHandle<()>,
+            sys_name: String,
+            mic_name: String,
         ) -> Self {
             Self {
                 _streams: streams,
                 format,
                 mixer_stop: Some(mixer_stop),
                 mixer_thread: Some(mixer_thread),
+                sys_name,
+                mic_name,
+                started: std::time::Instant::now(),
             }
         }
     }
@@ -236,13 +262,19 @@ mod cpal_impl {
     }
 
     fn start_stream(sp: &GenericService) -> ResultType<AudioStream> {
-        if hbb_common::config::option2bool(
+        // Mix only for the normal "system audio" capture. During a voice call (or with a custom
+        // audio-input) the capture source already IS a microphone, so mixing would open it twice
+        // (+6 dB, comb filtering) and drop system audio.
+        let mix_wanted = hbb_common::config::option2bool(
             "audio-mix-mic",
             &Config::get_option("audio-mix-mic"),
-        ) {
+        );
+        let voice_call = super::get_voice_call_input_device().is_some();
+        let custom_input = !Config::get_option("audio-input").is_empty();
+        if mix_wanted && !voice_call && !custom_input {
             match play_mixed(sp) {
-                Ok((streams, format, mixer_stop, mixer_thread)) => {
-                    return Ok(AudioStream::mixed(streams, format, mixer_stop, mixer_thread));
+                Ok(stream) => {
+                    return Ok(stream);
                 }
                 Err(err) => {
                     log::warn!(
@@ -290,9 +322,84 @@ mod cpal_impl {
 
     pub fn run(sp: EmptyExtraFieldService, state: &mut State) -> ResultType<()> {
         if !RESTARTING.load(Ordering::SeqCst) {
+            check_mixed_health(state);
+            if RESTARTING.load(Ordering::SeqCst) {
+                return run_restart(sp, state);
+            }
             run_serv_snapshot(sp, state)
         } else {
             run_restart(sp, state)
+        }
+    }
+
+    /// Mixed stream self-healing, called from the service loop (~every 33 ms, cheap):
+    /// - mixer thread gone -> drop the stream so the next snapshot recreates it
+    /// - every 3 s: default output/input device changed -> restart (picks up a plugged headset)
+    /// - every 3 s: mic delivered nothing for 2 s -> restart (max 3 in a row, then system-only)
+    fn check_mixed_health(state: &mut State) {
+        let dead_mixer = match &state.stream {
+            Some(s) => s.mixer_thread.as_ref().map(|t| t.is_finished()).unwrap_or(false),
+            None => false,
+        };
+        if dead_mixer {
+            log::warn!("audio mixer thread had stopped; recreating the mixed audio stream");
+            state.reset();
+            return;
+        }
+        let (sys_name, mic_name, started) = match &state.stream {
+            Some(s) if s.mixer_thread.is_some() => (s.sys_name.clone(), s.mic_name.clone(), s.started),
+            _ => return,
+        };
+        let now = std::time::Instant::now();
+        if let Some(t) = state.last_health_check {
+            if now.duration_since(t) < std::time::Duration::from_secs(3) {
+                return;
+            }
+        }
+        state.last_health_check = Some(now);
+        #[cfg(windows)]
+        {
+            let cur_sys = HOST
+                .default_output_device()
+                .and_then(|d| d.name().ok())
+                .unwrap_or_default();
+            let cur_mic = HOST
+                .default_input_device()
+                .and_then(|d| d.name().ok())
+                .unwrap_or_default();
+            if cur_sys != sys_name || cur_mic != mic_name {
+                log::info!(
+                    "default audio device changed ({} / {} -> {} / {}), restarting audio",
+                    sys_name,
+                    mic_name,
+                    cur_sys,
+                    cur_mic
+                );
+                super::restart();
+                return;
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (&sys_name, &mic_name);
+        if now.duration_since(started) < std::time::Duration::from_secs(3) {
+            return;
+        }
+        let mic_age = MIX.lock().unwrap().mic.age_ms(now_ms());
+        match mic_age {
+            Some(a) if a <= 2000 => {
+                MIC_WATCHDOG_RESTARTS.store(0, Ordering::SeqCst);
+            }
+            _ => {
+                let n = MIC_WATCHDOG_RESTARTS.load(Ordering::SeqCst);
+                if n < 3 {
+                    MIC_WATCHDOG_RESTARTS.store(n + 1, Ordering::SeqCst);
+                    log::warn!(
+                        "microphone delivered no audio for 2s+, restarting audio ({}/3)",
+                        n + 1
+                    );
+                    super::restart();
+                }
+            }
         }
     }
 
@@ -446,56 +553,62 @@ mod cpal_impl {
         ))
     }
 
-    fn play_mixed(
-        sp: &GenericService,
-    ) -> ResultType<(
-        Vec<Box<dyn StreamTrait>>,
-        Arc<Message>,
-        Arc<AtomicBool>,
-        std::thread::JoinHandle<()>,
-    )> {
+    fn play_mixed(sp: &GenericService) -> ResultType<AudioStream> {
         use cpal::SampleFormat::*;
         const MIX_SAMPLE_RATE: u32 = 48_000;
         const MIX_CHANNELS: u16 = 2;
         let (sys_device, sys_config) = get_device()?;
+        let sys_name = sys_device.name().unwrap_or("".to_owned());
         let mic_device = HOST
             .default_input_device()
             .with_context(|| "Failed to get default input device for microphone")?;
-        log::info!(
-            "Default microphone input device: {}",
-            mic_device.name().unwrap_or("".to_owned())
+        let mic_name = mic_device.name().unwrap_or("".to_owned());
+        log::info!("Default microphone input device: {}", mic_name);
+        // A "Stereo Mix"-style default input, or the same device as the system source, would
+        // double the system audio: use system audio only.
+        if mic_name == sys_name || crate::server::audio_mix::is_loopback_input_name(&mic_name) {
+            bail!(
+                "default input '{}' is the system source or a loopback device; not mixing",
+                mic_name
+            );
+        }
+        let params = crate::server::audio_mix::MixParams::from_options(
+            &Config::get_option("audio-mix-mic-gain-db"),
+            &Config::get_option("audio-mix-sys-gain-db"),
+            &Config::get_option("audio-mix-duck-db"),
+            &Config::get_option("audio-mix-gate-db"),
         );
+        log::info!("Mixed audio params: {:?}", params);
         let mic_config = mic_device
             .default_input_config()
             .map_err(|e| anyhow!(e))
             .with_context(|| "Failed to get default microphone input format")?;
         log::info!("Default microphone input format: {:?}", mic_config);
-        BUF_SYS.lock().unwrap().clear();
-        BUF_MIC.lock().unwrap().clear();
+        MIX.lock().unwrap().clear();
         let sys_stream = match sys_config.sample_format() {
-            I8 => build_mixed_input_stream::<i8>(sys_device, &sys_config, BUF_SYS.clone())?,
-            I16 => build_mixed_input_stream::<i16>(sys_device, &sys_config, BUF_SYS.clone())?,
-            I32 => build_mixed_input_stream::<i32>(sys_device, &sys_config, BUF_SYS.clone())?,
-            I64 => build_mixed_input_stream::<i64>(sys_device, &sys_config, BUF_SYS.clone())?,
-            U8 => build_mixed_input_stream::<u8>(sys_device, &sys_config, BUF_SYS.clone())?,
-            U16 => build_mixed_input_stream::<u16>(sys_device, &sys_config, BUF_SYS.clone())?,
-            U32 => build_mixed_input_stream::<u32>(sys_device, &sys_config, BUF_SYS.clone())?,
-            U64 => build_mixed_input_stream::<u64>(sys_device, &sys_config, BUF_SYS.clone())?,
-            F32 => build_mixed_input_stream::<f32>(sys_device, &sys_config, BUF_SYS.clone())?,
-            F64 => build_mixed_input_stream::<f64>(sys_device, &sys_config, BUF_SYS.clone())?,
+            I8 => build_mixed_input_stream::<i8>(sys_device, &sys_config, false)?,
+            I16 => build_mixed_input_stream::<i16>(sys_device, &sys_config, false)?,
+            I32 => build_mixed_input_stream::<i32>(sys_device, &sys_config, false)?,
+            I64 => build_mixed_input_stream::<i64>(sys_device, &sys_config, false)?,
+            U8 => build_mixed_input_stream::<u8>(sys_device, &sys_config, false)?,
+            U16 => build_mixed_input_stream::<u16>(sys_device, &sys_config, false)?,
+            U32 => build_mixed_input_stream::<u32>(sys_device, &sys_config, false)?,
+            U64 => build_mixed_input_stream::<u64>(sys_device, &sys_config, false)?,
+            F32 => build_mixed_input_stream::<f32>(sys_device, &sys_config, false)?,
+            F64 => build_mixed_input_stream::<f64>(sys_device, &sys_config, false)?,
             f => bail!("unsupported audio format: {:?}", f),
         };
         let mic_stream = match mic_config.sample_format() {
-            I8 => build_mixed_input_stream::<i8>(mic_device, &mic_config, BUF_MIC.clone())?,
-            I16 => build_mixed_input_stream::<i16>(mic_device, &mic_config, BUF_MIC.clone())?,
-            I32 => build_mixed_input_stream::<i32>(mic_device, &mic_config, BUF_MIC.clone())?,
-            I64 => build_mixed_input_stream::<i64>(mic_device, &mic_config, BUF_MIC.clone())?,
-            U8 => build_mixed_input_stream::<u8>(mic_device, &mic_config, BUF_MIC.clone())?,
-            U16 => build_mixed_input_stream::<u16>(mic_device, &mic_config, BUF_MIC.clone())?,
-            U32 => build_mixed_input_stream::<u32>(mic_device, &mic_config, BUF_MIC.clone())?,
-            U64 => build_mixed_input_stream::<u64>(mic_device, &mic_config, BUF_MIC.clone())?,
-            F32 => build_mixed_input_stream::<f32>(mic_device, &mic_config, BUF_MIC.clone())?,
-            F64 => build_mixed_input_stream::<f64>(mic_device, &mic_config, BUF_MIC.clone())?,
+            I8 => build_mixed_input_stream::<i8>(mic_device, &mic_config, true)?,
+            I16 => build_mixed_input_stream::<i16>(mic_device, &mic_config, true)?,
+            I32 => build_mixed_input_stream::<i32>(mic_device, &mic_config, true)?,
+            I64 => build_mixed_input_stream::<i64>(mic_device, &mic_config, true)?,
+            U8 => build_mixed_input_stream::<u8>(mic_device, &mic_config, true)?,
+            U16 => build_mixed_input_stream::<u16>(mic_device, &mic_config, true)?,
+            U32 => build_mixed_input_stream::<u32>(mic_device, &mic_config, true)?,
+            U64 => build_mixed_input_stream::<u64>(mic_device, &mic_config, true)?,
+            F32 => build_mixed_input_stream::<f32>(mic_device, &mic_config, true)?,
+            F64 => build_mixed_input_stream::<f64>(mic_device, &mic_config, true)?,
             f => bail!("unsupported microphone audio format: {:?}", f),
         };
         sys_stream.play()?;
@@ -504,31 +617,47 @@ mod cpal_impl {
             AUDIO_ZERO_COUNT = 0;
         }
         let mixer_stop = Arc::new(AtomicBool::new(false));
-        let mixer_thread = start_mixer(sp.clone(), mixer_stop.clone())?;
-        Ok((
+        let mixer_thread = start_mixer(sp.clone(), mixer_stop.clone(), params)?;
+        Ok(AudioStream::mixed(
             vec![Box::new(sys_stream), Box::new(mic_stream)],
             Arc::new(create_format_msg(MIX_SAMPLE_RATE, MIX_CHANNELS)),
             mixer_stop,
             mixer_thread,
+            sys_name,
+            mic_name,
         ))
     }
 
     fn build_mixed_input_stream<T>(
         device: cpal::Device,
         config: &cpal::SupportedStreamConfig,
-        buffer: Arc<Mutex<std::collections::VecDeque<f32>>>,
+        is_mic: bool,
     ) -> ResultType<cpal::Stream>
     where
         T: cpal::SizedSample + dasp::sample::ToSample<f32> + Send + 'static,
     {
-        const MIX_SAMPLE_RATE: u32 = 48_000;
-        const MIX_CHANNELS: u16 = 2;
-        const MAX_BUFFER_LEN: usize = MIX_SAMPLE_RATE as usize * MIX_CHANNELS as usize * 2;
-        let err_fn = move |err| {
-            log::trace!("an error occurred on mixed audio stream: {}", err);
+        let err_fn = move |err: cpal::StreamError| {
+            if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+                // unplugged / invalidated device: restart so the new default device is opened
+                log::warn!("mixed audio device no longer available ({}), restarting audio", err);
+                let now = now_ms().max(1);
+                let last = LAST_ERR_RESTART_MS.load(Ordering::SeqCst);
+                if last == 0 || now.saturating_sub(last) > 3000 {
+                    LAST_ERR_RESTART_MS.store(now, Ordering::SeqCst);
+                    super::restart();
+                }
+            } else {
+                log::trace!("an error occurred on mixed audio stream: {}", err);
+            }
         };
         let sample_rate_0 = config.sample_rate().0;
         let device_channel = config.channels();
+        // Channels first (at the device rate), then one stateful resampler per stream: correct for
+        // >2-channel devices at any rate, and continuous across callback chunks.
+        let mut resampler = crate::server::audio_mix::StreamResampler::new(
+            sample_rate_0,
+            crate::server::audio_mix::RATE,
+        );
         let timeout = None;
         let stream_config = StreamConfig {
             channels: device_channel,
@@ -538,29 +667,15 @@ mod cpal_impl {
         let stream = device.build_input_stream(
             &stream_config,
             move |data: &[T], _: &InputCallbackInfo| {
-                let mut data: Vec<f32> = data.iter().map(|s| T::to_sample(*s)).collect();
-                if sample_rate_0 != MIX_SAMPLE_RATE {
-                    data = crate::common::audio_resample(
-                        &data,
-                        sample_rate_0,
-                        MIX_SAMPLE_RATE,
-                        device_channel,
-                    );
-                }
-                if device_channel != MIX_CHANNELS {
-                    data = crate::common::audio_rechannel(
-                        data,
-                        MIX_SAMPLE_RATE,
-                        MIX_SAMPLE_RATE,
-                        device_channel,
-                        MIX_CHANNELS,
-                    );
-                }
-                let mut lock = buffer.lock().unwrap();
-                lock.extend(data);
-                if lock.len() > MAX_BUFFER_LEN {
-                    let excess = lock.len() - MAX_BUFFER_LEN;
-                    lock.drain(0..excess);
+                let samples: Vec<f32> = data.iter().map(|s| T::to_sample(*s)).collect();
+                let stereo = crate::server::audio_mix::to_stereo(&samples, device_channel as usize);
+                let out = resampler.process(&stereo);
+                let now = now_ms();
+                let mut mix = MIX.lock().unwrap();
+                if is_mic {
+                    mix.mic.push(&out, now);
+                } else {
+                    mix.sys.push(&out, now);
                 }
             },
             err_fn,
@@ -569,47 +684,47 @@ mod cpal_impl {
         Ok(stream)
     }
 
+    /// Mixer thread. Runs until `stop` (set by State::reset on restart / teardown); it no longer
+    /// exits on its own when there are briefly no subscribers or while a restart is pending, which
+    /// could leave a session silent. With no subscribers, frames are still drained (no stale
+    /// backlog when someone reconnects) but not sent.
     fn start_mixer(
         sp: GenericService,
         stop: Arc<AtomicBool>,
+        params: crate::server::audio_mix::MixParams,
     ) -> ResultType<std::thread::JoinHandle<()>> {
         let mut encoder = Encoder::new(48_000, Stereo, LowDelay)?;
         Ok(std::thread::spawn(move || {
-            const FRAME_LEN: usize = 960;
-            while sp.ok()
-                && !RESTARTING.load(Ordering::SeqCst)
-                && !stop.load(Ordering::SeqCst)
-            {
-                let sys_len = BUF_SYS.lock().unwrap().len();
-                let mic_len = BUF_MIC.lock().unwrap().len();
-                if sys_len == 0 && mic_len == 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    continue;
-                }
-                let mut sys = drain_audio(&*BUF_SYS, FRAME_LEN);
-                let mut mic = drain_audio(&*BUF_MIC, FRAME_LEN);
-                sys.resize(FRAME_LEN, 0.);
-                mic.resize(FRAME_LEN, 0.);
-                let mixed: Vec<f32> = sys
-                    .iter()
-                    .zip(mic.iter())
-                    .map(|(s, m)| (*s + *m).clamp(-1., 1.))
-                    .collect();
-                send_f32(&mixed, &mut encoder, &sp);
-                if sys_len < FRAME_LEN || mic_len < FRAME_LEN {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut dsp = crate::server::audio_mix::Dsp::new(params);
+            let (mut sent, mut sys_pad, mut mic_pad) = (0u64, 0u64, 0u64);
+            while !stop.load(Ordering::SeqCst) {
+                let frame = MIX.lock().unwrap().next_frame(now_ms());
+                match frame {
+                    Some(f) => {
+                        if f.sys_padded {
+                            sys_pad += 1;
+                        }
+                        if f.mic_padded {
+                            mic_pad += 1;
+                        }
+                        let out = dsp.process(&f.sys, &f.mic);
+                        if sp.ok() {
+                            send_f32(&out, &mut encoder, &sp);
+                            sent += 1;
+                        }
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(2)),
                 }
             }
+            let trimmed = MIX.lock().unwrap().trimmed;
+            log::info!(
+                "audio mixer stopped: {} frames sent, {} sys-padded, {} mic-padded, {} samples trimmed",
+                sent,
+                sys_pad,
+                mic_pad,
+                trimmed
+            );
         }))
-    }
-
-    fn drain_audio(
-        buffer: &Arc<Mutex<std::collections::VecDeque<f32>>>,
-        len: usize,
-    ) -> Vec<f32> {
-        let mut lock = buffer.lock().unwrap();
-        let take = lock.len().min(len);
-        lock.drain(0..take).collect()
     }
 
     fn build_input_stream<T>(

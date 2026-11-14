@@ -1,0 +1,34 @@
+name: kg3n-audio-test
+# Unit tests for the pure mixing logic (src/server/audio_mix.rs) of the KG3N mic + system audio
+# mix. Compiles ONLY that file in a throwaway crate (no vcpkg/flutter), with the same Rust version
+# the Windows client build uses (1.75) plus stable. A couple of minutes.
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ audio-fixes ]
+    paths:
+      - 'src/server/audio_mix.rs'
+      - '.github/workflows/kg3n-audio-test.yml'
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [ "1.75", "stable" ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: src/server/audio_mix.rs
+          sparse-checkout-cone-mode: false
+      - name: Install Rust ${{ matrix.toolchain }}
+        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --no-self-update
+      - name: Test audio_mix.rs
+        run: |
+          mkdir -p /tmp/mixtest/src
+          printf '[package]\nname = "mixtest"\nversion = "0.1.0"\nedition = "2021"\n' > /tmp/mixtest/Cargo.toml
+          printf '#[path = "%s/src/server/audio_mix.rs"]\npub mod audio_mix;\n' "$GITHUB_WORKSPACE" > /tmp/mixtest/src/lib.rs
+          cd /tmp/mixtest
+          cargo +${{ matrix.toolchain }} test --release -- --nocapture

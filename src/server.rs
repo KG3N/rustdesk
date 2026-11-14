@@ -33,6 +33,7 @@ use video_service::VideoSource;
 use crate::ipc::Data;
 
 pub mod audio_service;
+mod audio_mix; // KG3N: pure mixing logic for audio-mix-mic (unit-tested on its own)
 #[cfg(target_os = "windows")]
 pub mod terminal_helper;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]

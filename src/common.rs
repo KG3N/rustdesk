@@ -2098,7 +2098,6 @@ pub fn load_custom_client() {
             ("allow-hide-cm", "Y"),
             ("disable-floating-window", "Y"),
             ("hide-tray", "Y"),
-            ("audio-mix-mic", "Y"),
             ("allow-logon-screen-password", "Y"),
             ("allow-remote-config-modification", "N"),
             ("hide-server-settings", "Y"),
@@ -2117,6 +2116,27 @@ pub fn load_custom_client() {
                 display_settings.insert(kk.clone(), v.to_string());
                 buildin_settings.insert(kk, v.to_string());
             }
+        }
+    }
+    {
+        // KG3N audio mix: DEFAULTS, not locked overrides, so a single machine can be tuned without
+        // rebuilding: `rustdesk.exe --option <key> <value>` (installed + elevated; e.g. through the
+        // fleet console as SYSTEM). Changes apply live (ipc.rs CheckIfRestart restarts audio).
+        //   audio-mix-mic          Y/N   mix the default microphone into the system audio
+        //   audio-mix-mic-gain-db  0     -24..+24
+        //   audio-mix-sys-gain-db  -3    -24..+12
+        //   audio-mix-duck-db      0     0 = off; e.g. 8 = system audio 8 dB down while speaking
+        //   audio-mix-gate-db      -55   below this the mix is sent as silence; 0 = gate off
+        let defaults: &[(&str, &str)] = &[
+            ("audio-mix-mic", "Y"),
+            ("audio-mix-mic-gain-db", "0"),
+            ("audio-mix-sys-gain-db", "-3"),
+            ("audio-mix-duck-db", "0"),
+            ("audio-mix-gate-db", "-55"),
+        ];
+        let mut d = config::DEFAULT_SETTINGS.write().unwrap();
+        for (k, v) in defaults {
+            d.insert(k.to_string(), v.to_string());
         }
     }
     #[cfg(debug_assertions)]

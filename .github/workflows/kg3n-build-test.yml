@@ -1,0 +1,17 @@
+name: kg3n-build-test
+# TEST build of the KG3N custom Windows client (same pipeline as kg3n-build), published to a
+# separate PRE-RELEASE tag so it can never replace the production kg3n-1.4.9 installer that the
+# fleet's Upgrade button uses. Runs only on a push to the audio-fixes-build branch.
+on:
+  push:
+    branches: [ audio-fixes-build ]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  build:
+    uses: ./.github/workflows/flutter-build.yml
+    with:
+      upload-artifact: true
+      upload-tag: "kg3n-1.4.9-audiotest"
+    secrets: inherit
